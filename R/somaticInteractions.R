@@ -69,41 +69,50 @@ somaticInteractions = function(maf, top = 25, genes = NULL, pvalue = c(0.05, 0.0
   #return(mutMat)
 
   #pairwise fisher test source code borrowed from: https://www.nature.com/articles/ncomms6901
-  interactions = sapply(1:ncol(mutMat), function(i)
-    sapply(1:ncol(mutMat), function(j) {
-      f = try(fisher.test(mutMat[, i], mutMat[, j]), silent = TRUE)
-      if (class(f) == "try-error"){
-        if(all(mutMat[,i] == mutMat[,j])){
-          if(colnames(mutMat)[i] != colnames(mutMat)[j]){
-            warning("All the samples are in the same direction for the genes ", colnames(mutMat)[i], " and ",  colnames(mutMat)[j], "! Could not perform Fisher test.")
-          }
-          NA
-        }else{
-          if(colnames(mutMat)[i] != colnames(mutMat)[j]){
-            warning("Contigency table could not created for the genes ", colnames(mutMat)[i], " and ",  colnames(mutMat)[j], "! Could not perform Fisher test.")
-          }
-          NA
-        }
-      }else{
-        ifelse(f$estimate > 1,-log10(f$p.val), log10(f$p.val))
-      }
-    }))
-  #return(interactions)
-  oddsRatio <-
-    oddsGenes <-
-    sapply(1:ncol(mutMat), function(i)
-      sapply(1:ncol(mutMat), function(j) {
-        f = try(fisher.test(mutMat[, i], mutMat[, j]), silent = TRUE)
-        if (class(f) == "try-error")
-          if(all(mutMat[,i] == mutMat[,j])){
-            NA
+  #All 2x2 tables come from one co-mutation count matrix, so no table is rebuilt from the sample
+  #vectors for each pair. fisher.test() then runs once per ordered pair on the 2x2 counts, the same
+  #table fisher.test(x, y) builds from the two 0/1 vectors, so p-values and odds ratios are unchanged.
+  mutMat = as.matrix(mutMat)
+  nSamples = nrow(mutMat)
+  nGenes = ncol(mutMat)
+  geneNames = colnames(mutMat)
+  #n11[i, j]: samples mutated in both gene i and gene j. Sums of 0/1 products are exact integers
+  #under any BLAS, so crossprod() gives the exact counts.
+  n11 = crossprod(mutMat)
+  storage.mode(n11) = "integer"
+  nMut = as.integer(diag(n11)) #samples mutated per gene
+  nMutRow = matrix(nMut, nrow = nGenes, ncol = nGenes)
+  nMutCol = matrix(nMut, nrow = nGenes, ncol = nGenes, byrow = TRUE)
+  n10 = nMutRow - n11 #row gene mutated, column gene not
+  n01 = nMutCol - n11 #column gene mutated, row gene not
+  n00 = nSamples - nMutRow - nMutCol + n11
+  #fisher.test(x, y) fails for a gene mutated in no sample or in every sample
+  degenerate = nMut == 0L | nMut == nSamples
+
+  #both (i, j) and (j, i) are computed: fisher.test() on the transposed table differs in the last
+  #bits, so halving the loop by symmetry would change the results
+  interactions = matrix(NA_real_, nrow = nGenes, ncol = nGenes)
+  oddsRatio = matrix(NA_real_, nrow = nGenes, ncol = nGenes)
+  for(i in seq_len(nGenes)){
+    for(j in seq_len(nGenes)){
+      #interactions[j, i] is fisher.test(x = gene i, y = gene j), i.e. table(x, y) with
+      #[1, 1] = neither, [2, 1] = gene i only, [1, 2] = gene j only, [2, 2] = both
+      if(degenerate[i] | degenerate[j]){
+        if(geneNames[i] != geneNames[j]){
+          if(n11[j, i] == nMut[i] & n11[j, i] == nMut[j]){
+            warning("All the samples are in the same direction for the genes ", geneNames[i], " and ",  geneNames[j], "! Could not perform Fisher test.")
           }else{
-            NA
+            warning("Contigency table could not created for the genes ", geneNames[i], " and ",  geneNames[j], "! Could not perform Fisher test.")
           }
-        else
-          f$estimate
-      }))
-  rownames(interactions) = colnames(interactions) = rownames(oddsRatio) = colnames(oddsRatio) = colnames(mutMat)
+        }
+        next
+      }
+      f = fisher.test(matrix(c(n00[j, i], n01[j, i], n10[j, i], n11[j, i]), nrow = 2), conf.int = FALSE)
+      interactions[j, i] = ifelse(f$estimate > 1, -log10(f$p.val), log10(f$p.val))
+      oddsRatio[j, i] = f$estimate
+    }
+  }
+  rownames(interactions) = colnames(interactions) = rownames(oddsRatio) = colnames(oddsRatio) = geneNames
 
   sigPairs = which(x = 10^-abs(interactions) < 1, arr.ind = TRUE)
   sigPairs2 = which(x = 10^-abs(interactions) >= 1, arr.ind = TRUE)
@@ -113,28 +122,20 @@ somaticInteractions = function(maf, top = 25, genes = NULL, pvalue = c(0.05, 0.0
   }
 
   sigPairs = rbind(sigPairs, sigPairs2)
-  sigPairsTbl = data.table::rbindlist(
-                          lapply(X = seq_along(1:nrow(sigPairs)), function(i) {
-                                  x = sigPairs[i,]
-                                  g1 = rownames(interactions[x[1], x[2], drop = FALSE])
-                                  g2 = colnames(interactions[x[1], x[2], drop = FALSE])
-                                  #tbl = as.data.frame(table(apply(X = mutMat[,c(g1, g2), drop = FALSE], 1, paste, collapse = "")))
-                                  tbl = as.data.frame(table(factor(apply(X = mutMat[,c(g1, g2), drop = FALSE], 1, paste, collapse = ""), levels = c("00", "01","11", "10"))))
-                                  combn = data.frame(t(tbl$Freq))
-                                  colnames(combn) = tbl$Var1
-                                  pval = 10^-abs(interactions[x[1], x[2]])
-                                  fest = oddsRatio[x[1], x[2]]
-                                  d = data.table::data.table(gene1 = g1,
-                                                         gene2 = g2,
-                                                         pValue = pval, oddsRatio = fest)
-                                  d = cbind(d, combn)
-                                  d
-                        }), fill = TRUE)
+  #the 2x2 counts of each pair, in the "00", "01", "11", "10" order of the previous table() call
+  sigPairsTbl = data.table::data.table(gene1 = geneNames[sigPairs[, 1]], gene2 = geneNames[sigPairs[, 2]],
+                                       pValue = 10^-abs(interactions[sigPairs]), oddsRatio = oddsRatio[sigPairs],
+                                       `00` = n00[sigPairs], `01` = n01[sigPairs], `11` = n11[sigPairs], `10` = n10[sigPairs])
 
   sigPairsTbl[, pAdj := p.adjust(pValue, method = 'fdr')]
   sigPairsTbl[is.na(sigPairsTbl)] = 0
   sigPairsTbl$Event = ifelse(test = sigPairsTbl$oddsRatio > 1, yes = "Co_Occurrence", no = "Mutually_Exclusive")
-  sigPairsTbl$pair = apply(X = sigPairsTbl[,.(gene1, gene2)], MARGIN = 1, FUN = function(x) paste(sort(unique(x)), collapse = ", "))
+  #same key as paste(sort(unique(c(gene1, gene2))), collapse = ", "): sort() of two strings swaps
+  #them only when the first collates strictly after the second
+  sigPairsTbl$pair = ifelse(sigPairsTbl$gene1 == sigPairsTbl$gene2, sigPairsTbl$gene1,
+                            ifelse(sigPairsTbl$gene1 > sigPairsTbl$gene2,
+                                   paste(sigPairsTbl$gene2, sigPairsTbl$gene1, sep = ", "),
+                                   paste(sigPairsTbl$gene1, sigPairsTbl$gene2, sep = ", ")))
   sigPairsTbl[,event_ratio := `01`+`10`]
   sigPairsTbl[,event_ratio := paste0(`11`, '/', event_ratio)]
   sigPairsTblSig = sigPairsTbl[order(as.numeric(pValue))][!duplicated(pair)]
@@ -221,43 +222,46 @@ somaticInteractions = function(maf, top = 25, genes = NULL, pvalue = c(0.05, 0.0
 
       if(countStats == 'sig'){
         w = arrayInd(which(10^-abs(interactions) < max(pvalue)), rep(m,2))
-        for(i in 1:nrow(w)){
-          g1 = rownames(interactions)[w[i, 1]]
-          g2 = colnames(interactions)[w[i, 2]]
-          g12 = paste(sort(c(g1, g2)), collapse = ', ')
-          if(countType == 'all'){
-            e = sigPairsTblSig[pValue < max(pvalue)][pair %in% g12, event_ratio]
-          }else if(countType == 'cooccur'){
-            e = sigPairsTblSig[pValue < max(pvalue)][Event %in% "Co_Occurrence"][pair %in% g12, `11`]
-          }else if(countType == 'mutexcl'){
-            e = sigPairsTblSig[pValue < max(pvalue)][Event %in% "Mutually_Exclusive"][pair %in% g12, `11`]
-          }
-          if(length(e) == 0){
-            e = 0
-          }
-          text(w[i,1], w[i,2], labels = e, font = 3, col = countsFontColor, cex = countsFontSize)
-        }
       }else if(countStats == 'all'){
         w = arrayInd(which(10^-abs(interactions) < max(pvalue)), rep(m,2))
         w2 = arrayInd(which(10^-abs(interactions) >= max(pvalue)), rep(m,2))
         w = rbind(w, w2)
-        #print(w)
-        for(i in 1:nrow(w)){
-          g1 = rownames(interactions)[w[i, 1]]
-          g2 = colnames(interactions)[w[i, 2]]
-          g12 = paste(sort(c(g1, g2)), collapse = ', ')
-          if(countType == 'all'){
-            e = sigPairsTblSig[pair %in% g12, event_ratio]
-          }else if(countType == 'cooccur'){
-            e = sigPairsTblSig[pair %in% g12, `11`]
-          }else if(countType == 'mutexcl'){
-            e = sigPairsTblSig[pair %in% g12, `01` + `10`]
-          }
-          if(length(e) == 0){
-            e = 0
-          }
-          text(w[i,1], w[i,2], labels = e, font = 3, col = countsFontColor, cex = countsFontSize)
+      }
+      #pair key of every plotted cell, built like the pair column
+      cellKeys = vapply(seq_len(nrow(w)), function(i){
+        paste(sort(c(rownames(interactions)[w[i, 1]], colnames(interactions)[w[i, 2]])), collapse = ', ')
+      }, character(1))
+
+      #the pair table is filtered once and each cell does one match() on its key
+      if(countStats == 'sig'){
+        countsTbl = sigPairsTblSig[pValue < max(pvalue)]
+        if(countType == 'all'){
+          countsVal = countsTbl[, event_ratio]
+        }else if(countType == 'cooccur'){
+          countsTbl = countsTbl[Event %in% "Co_Occurrence"]
+          countsVal = countsTbl[, `11`]
+        }else if(countType == 'mutexcl'){
+          countsTbl = countsTbl[Event %in% "Mutually_Exclusive"]
+          countsVal = countsTbl[, `11`]
         }
+      }else if(countStats == 'all'){
+        #this %in% subset leaves the same data.table auto-index on sigPairsTblSig as the previous
+        #per-cell lookups did, so the returned table is unchanged
+        countsTbl = sigPairsTblSig[pair %in% cellKeys]
+        if(countType == 'all'){
+          countsVal = countsTbl[, event_ratio]
+        }else if(countType == 'cooccur'){
+          countsVal = countsTbl[, `11`]
+        }else if(countType == 'mutexcl'){
+          countsVal = countsTbl[, `01` + `10`]
+        }
+      }
+      for(i in 1:nrow(w)){
+        e = countsVal[match(cellKeys[i], countsTbl$pair)]
+        if(is.na(e)){
+          e = 0
+        }
+        text(w[i,1], w[i,2], labels = e, font = 3, col = countsFontColor, cex = countsFontSize)
       }
     }
 
